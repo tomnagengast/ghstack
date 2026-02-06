@@ -1,0 +1,665 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.13"
+# dependencies = [
+#   "rich",
+# ]
+# ///
+"""
+ghstack - PR Stack Tree Visualizer
+
+Visualizes the PR dependency tree for the current repo, showing
+parent/child relationships derived from GitHub PR baseRefName chains.
+PR numbers are clickable links (cmd+click in supported terminals).
+
+Usage:
+    ghstack              Show current branch's lineage (ancestors, descendants,
+                         and descendants of ancestors)
+    ghstack --all        Show the full tree for all PRs
+    ghstack --refresh    Force a full API re-fetch (bypass cache)
+    ghstack --open       Show only open PRs (full graph)
+    ghstack --draft      Show only draft PRs (full graph)
+    ghstack --created [N]  PRs created within N days (default: 2)
+    ghstack --updated [N]  PRs updated within N days (default: 2)
+    ghstack --merged [N]   PRs merged within N days (default: 2)
+    ghstack --closed [N]   PRs closed within N days (default: 2)
+    ghstack --up         Switch to parent PR branch (toward main)
+    ghstack --down       Switch to child PR branch (toward leaves)
+
+    Filters are AND'd. Any filter flag switches to full graph mode.
+    Combine with --all: ghstack --all --created 7
+
+Navigation (--up/--down):
+    In worktree repos, prints the target worktree path to stdout.
+    Requires a shell wrapper to cd (see env/zsh/aliases/gh.zsh).
+    In plain repos, runs git checkout directly.
+
+Caching:
+    API responses are cached at ~/.cache/ghstack/{owner}-{repo}.json.
+    < 60s old:  cached data used directly (~0.1s)
+    60s–10min:  incremental update (only changed PRs fetched)
+    > 10min:    full re-fetch
+
+Example:
+    #258 feat: add export button        <- current branch's PR (header)
+    main
+    └── #243 refactor: config-driven handlers
+        ├── #245 feat: CSV download              (green = open)
+        │   └── #258 feat: add export button     (bold = current branch)
+        │       └── #277 fix: export encoding    (gray = draft)
+        └── #247 feat: generate env.yaml         (magenta = merged, underline = approved)
+
+Styling:
+    green            open
+    gray/dim         draft
+    magenta          merged
+    red              closed
+    bg:#f6c177       current branch
+    bg:green/white   approved
+    underline        has review comments
+    double underline changes requested
+"""
+
+import argparse
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+from rich.console import Console
+from rich.style import Style
+from rich.tree import Tree
+
+
+def days_ago_iso(days: int) -> str:
+    """Return ISO date string for N days ago (UTC)."""
+    return (datetime.now(timezone.utc) - timedelta(days=days)).strftime("%Y-%m-%d")
+
+
+def within_days(iso_ts: str | None, days: int) -> bool:
+    """Check if an ISO timestamp is within N days of now."""
+    if not iso_ts:
+        return False
+    dt = datetime.fromisoformat(iso_ts.replace("Z", "+00:00"))
+    return (datetime.now(timezone.utc) - dt).days <= days
+
+
+CACHE_DIR = Path.home() / ".cache" / "ghstack"
+REPO_ID_RE = re.compile(r"github\.com[:/](.+?)(?:\.git)?$")
+HOT_TTL = 60  # seconds
+WARM_TTL = 600  # seconds
+
+PR_FIELDS = """
+        number title state isDraft headRefName baseRefName
+        reviewDecision updatedAt createdAt closedAt mergedAt
+        author { login }
+        latestReviews(first: 10) { nodes { state } }"""
+
+PULLS_QUERY = """
+query($owner: String!, $repo: String!, $cursor: String) {
+  repository(owner: $owner, name: $repo) {
+    defaultBranchRef { name }
+    url
+    pullRequests(first: 100, after: $cursor, states: [OPEN],
+                 orderBy: {field: UPDATED_AT, direction: DESC}) {
+      pageInfo { hasNextPage endCursor }
+      nodes {""" + PR_FIELDS + """
+      }
+    }
+  }
+}
+"""
+
+SEARCH_QUERY = """
+query($q: String!, $cursor: String) {
+  search(query: $q, type: ISSUE, first: 100, after: $cursor) {
+    pageInfo { hasNextPage endCursor }
+    nodes {
+      ... on PullRequest {""" + PR_FIELDS + """
+      }
+    }
+  }
+}
+"""
+
+
+def parse_repo_id(remote_url: str) -> str | None:
+    """Extract 'owner/repo' from a GitHub remote URL."""
+    m = REPO_ID_RE.search(remote_url)
+    return m.group(1) if m else None
+
+
+def cache_path(repo_id: str) -> Path:
+    """Return cache file path for a repo, e.g. ~/.cache/ghstack/owner-repo.json."""
+    return CACHE_DIR / f"{repo_id.replace('/', '-')}.json"
+
+
+def load_cache(path: Path) -> dict | None:
+    """Load cache from disk. Returns None if missing or corrupt."""
+    try:
+        return json.loads(path.read_text())
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return None
+
+
+def save_cache(path: Path, data: dict) -> None:
+    """Atomically write cache to disk."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=path.parent, suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(data, f)
+        os.replace(tmp, path)
+    except BaseException:
+        os.unlink(tmp)
+        raise
+
+
+def run_graphql(query: str, **variables) -> dict:
+    """Run a GraphQL query via gh api graphql."""
+    cmd = ["gh", "api", "graphql", "-f", f"query={query}"]
+    for key, val in variables.items():
+        if val is None:
+            continue
+        cmd.extend(["-f", f"{key}={val}"])
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        print(f"Error: gh api graphql: {result.stderr.strip()}", file=sys.stderr)
+        sys.exit(1)
+    data = json.loads(result.stdout)
+    if "errors" in data:
+        print(f"GraphQL error: {data['errors'][0]['message']}", file=sys.stderr)
+        sys.exit(1)
+    return data
+
+
+def normalize_pr(node: dict) -> dict:
+    """Reshape GraphQL PR node to match expected format (flatten latestReviews.nodes)."""
+    node["latestReviews"] = node.get("latestReviews", {}).get("nodes", [])
+    return node
+
+
+def get_branch() -> str:
+    return subprocess.run(
+        ["git", "branch", "--show-current"],
+        capture_output=True, text=True, check=True,
+    ).stdout.strip()
+
+
+def die(msg: str) -> None:
+    """Print error to stderr and exit."""
+    print(f"Error: {msg}", file=sys.stderr)
+    sys.exit(1)
+
+
+def find_worktree_path(branch: str) -> str | None:
+    """Find the worktree directory for a branch via git worktree list, or None."""
+    result = subprocess.run(
+        ["git", "worktree", "list", "--porcelain"],
+        capture_output=True, text=True,
+    )
+    if result.returncode != 0:
+        return None
+    path = None
+    for line in result.stdout.splitlines():
+        if line.startswith("worktree "):
+            path = line[len("worktree "):]
+        elif line.startswith("branch refs/heads/") and path:
+            if line[len("branch refs/heads/"):] == branch:
+                return path
+    return None
+
+
+def pick_branch(children: list[dict]) -> str | None:
+    """Prompt user to pick a child branch when multiple exist. Returns headRefName or None."""
+    if len(children) == 1:
+        return children[0]["headRefName"]
+    console = Console(stderr=True)
+    console.print("Multiple descendants:")
+    for i, pr in enumerate(children, 1):
+        console.print(f"  {i}) #{pr['number']} {pr['title']}")
+    try:
+        choice = input(f"Select [1-{len(children)}]: ")
+        idx = int(choice) - 1
+        if 0 <= idx < len(children):
+            return children[idx]["headRefName"]
+    except (ValueError, EOFError, KeyboardInterrupt):
+        pass
+    return None
+
+
+def fetch_cold(owner: str, repo_name: str) -> tuple[str, str, str, dict[str, dict]]:
+    """Full fetch via GraphQL pagination. Returns (branch, default_branch, repo_url, prs_by_number)."""
+    branch = get_branch()
+    prs: dict[str, dict] = {}
+    default_branch = repo_url = None
+    cursor = None
+
+    while True:
+        data = run_graphql(PULLS_QUERY, owner=owner, repo=repo_name, cursor=cursor)
+        repo_data = data["data"]["repository"]
+        if default_branch is None:
+            default_branch = repo_data["defaultBranchRef"]["name"]
+            repo_url = repo_data["url"]
+        for node in repo_data["pullRequests"]["nodes"]:
+            prs[str(node["number"])] = normalize_pr(node)
+        page_info = repo_data["pullRequests"]["pageInfo"]
+        if not page_info["hasNextPage"]:
+            break
+        cursor = page_info["endCursor"]
+
+    return branch, default_branch, repo_url, prs
+
+
+def search_prs(owner: str, repo_name: str, qualifiers: str) -> dict[str, dict]:
+    """Search PRs via GraphQL with arbitrary qualifiers. Returns PRs keyed by number string."""
+    search_q = f"repo:{owner}/{repo_name} is:pr {qualifiers}"
+    prs: dict[str, dict] = {}
+    cursor = None
+
+    while True:
+        data = run_graphql(SEARCH_QUERY, q=search_q, cursor=cursor)
+        for node in data["data"]["search"]["nodes"]:
+            if node:  # search can return empty nodes for non-PR types
+                prs[str(node["number"])] = normalize_pr(node)
+        page_info = data["data"]["search"]["pageInfo"]
+        if not page_info["hasNextPage"]:
+            break
+        cursor = page_info["endCursor"]
+
+    return prs
+
+
+def fetch_incremental(owner: str, repo_name: str, cache: dict) -> tuple[str, dict[str, dict]]:
+    """Fetch only PRs updated since watermark via GraphQL search."""
+    watermark = datetime.fromtimestamp(cache["fetched_at"] - 120, tz=timezone.utc)
+    watermark_str = watermark.strftime("%Y-%m-%dT%H:%M:%SZ")
+    return get_branch(), search_prs(owner, repo_name, f"updated:>={watermark_str}")
+
+
+def resolve_repo() -> tuple[str, str, str]:
+    """Resolve repo identity from local git remote. Returns (repo_id, owner, repo_name)."""
+    try:
+        remote_url = subprocess.run(
+            ["git", "remote", "get-url", "origin"],
+            capture_output=True, text=True, check=True,
+        ).stdout.strip()
+    except subprocess.CalledProcessError:
+        remote_url = ""
+
+    repo_id = parse_repo_id(remote_url)
+    if not repo_id:
+        print("Error: could not determine GitHub repo from git remote", file=sys.stderr)
+        sys.exit(1)
+
+    owner, repo_name = repo_id.split("/", 1)
+    return repo_id, owner, repo_name
+
+
+def fetch_all(force_refresh: bool = False) -> tuple[str, str, str, list[dict]]:
+    """Fetch current branch, default branch, repo URL, and PRs with caching."""
+    repo_id, owner, repo_name = resolve_repo()
+    cp = cache_path(repo_id)
+    cache = None if force_refresh else load_cache(cp)
+    now = time.time()
+    age = now - cache["fetched_at"] if cache else float("inf")
+
+    # Hot path: cache < 60s old
+    if cache and age < HOT_TTL:
+        return get_branch(), cache["default_branch"], cache["repo_url"], list(cache["prs"].values())
+
+    # Warm path: cache 60s–10min old
+    if cache and age < WARM_TTL:
+        branch, updated_prs = fetch_incremental(owner, repo_name, cache)
+        cache["prs"].update(updated_prs)
+        cache["fetched_at"] = now
+        save_cache(cp, cache)
+        return branch, cache["default_branch"], cache["repo_url"], list(cache["prs"].values())
+
+    # Cold path: full fetch
+    branch, default_branch, repo_url, prs = fetch_cold(owner, repo_name)
+    save_cache(cp, {
+        "fetched_at": now,
+        "default_branch": default_branch,
+        "repo_url": repo_url,
+        "prs": prs,
+    })
+    return branch, default_branch, repo_url, list(prs.values())
+
+
+def build_style(pr: dict) -> Style:
+    color = None
+    bgcolor = None
+    underline = False
+    underline2 = False
+
+    state = pr["state"]
+    is_draft = pr.get("isDraft", False)
+    review = pr.get("reviewDecision")
+    latest_reviews = pr.get("latestReviews") or []
+
+    # State color
+    if is_draft and state == "OPEN":
+        color = "bright_black"
+    elif state == "OPEN":
+        color = "green"
+    elif state == "MERGED":
+        color = "magenta"
+    elif state == "CLOSED":
+        color = "red"
+
+    # Review decorations
+    if review == "APPROVED":
+        bgcolor = "green"
+        color = "white"
+    if review == "CHANGES_REQUESTED":
+        underline2 = True
+    if any(r.get("state") == "COMMENTED" for r in latest_reviews):
+        underline = True
+
+    return Style(color=color, bgcolor=bgcolor, underline=underline, underline2=underline2)
+
+
+def pr_label(pr: dict, current_branch: str, max_width: int, repo_url: str, show_author: bool = False) -> str:
+    style = build_style(pr)
+    is_current = pr["headRefName"] == current_branch
+    if is_current:
+        style = style + Style(bgcolor="#f6c177", color="#191724")
+
+    pr_url = f"{repo_url}/pull/{pr['number']}"
+    link_style = style + Style(link=pr_url)
+    author = pr.get("author", {}).get("login", "")
+    author_part = f" @{author} -" if show_author and author else ""
+    prefix = f"#{pr['number']}{author_part}"
+    title = pr["title"]
+    available = max_width - len(prefix) - 1
+    if available > 0 and len(title) > available:
+        title = title[: available - 1] + "\u2026"
+    return f"[{link_style}]{prefix}[/] [dim]{title}[/dim]"
+
+
+def collect_spine(
+    current_branch: str,
+    branch_to_pr: dict[str, dict],
+) -> set[str]:
+    """Collect headRefNames on the path from current branch up to the root.
+
+    Returns the set of branch names that form the direct ancestor chain,
+    including the current branch itself.
+    """
+    spine = {current_branch}
+    branch = current_branch
+    while branch in branch_to_pr:
+        pr = branch_to_pr[branch]
+        branch = pr["baseRefName"]
+        if branch in spine:
+            break
+        spine.add(branch)
+    return spine
+
+
+def collect_visible_prs(
+    node_branch: str,
+    adjacency: dict[str, list[dict]],
+    spine: set[str] | None,
+    in_subtree: bool = False,
+    visited: set[str] | None = None,
+) -> list[dict]:
+    """Collect PRs that would be rendered, using same spine logic as build_tree_recursive."""
+    if visited is None:
+        visited = set()
+    result = []
+    for pr in adjacency.get(node_branch, []):
+        head = pr["headRefName"]
+        if head in visited:
+            continue
+        if spine is not None and not in_subtree and head not in spine:
+            continue
+        visited.add(head)
+        result.append(pr)
+        result.extend(collect_visible_prs(head, adjacency, spine, in_subtree or (spine is not None and head in spine), visited))
+    return result
+
+
+def build_tree_recursive(
+    node_branch: str,
+    adjacency: dict[str, list[dict]],
+    branch_to_pr: dict[str, dict],
+    current_branch: str,
+    max_width: int,
+    repo_url: str,
+    parent_tree: Tree,
+    spine: set[str] | None,
+    show_author: bool = False,
+    in_subtree: bool = False,
+    depth: int = 0,
+    visited: set[str] | None = None,
+):
+    if visited is None:
+        visited = set()
+    children = adjacency.get(node_branch, [])
+    for pr in children:
+        head = pr["headRefName"]
+        if head in visited:
+            continue
+        if spine is not None and not in_subtree and head not in spine:
+            continue
+        visited.add(head)
+        label = pr_label(pr, current_branch, max_width - depth * 4, repo_url, show_author)
+        child_tree = parent_tree.add(label)
+        child_in_subtree = in_subtree or (spine is not None and head in spine)
+        build_tree_recursive(
+            head, adjacency, branch_to_pr, current_branch, max_width, repo_url,
+            child_tree, spine, show_author, child_in_subtree, depth + 1, visited,
+        )
+
+
+def main():
+    parser = argparse.ArgumentParser(description="PR Stack Tree Visualizer")
+    parser.add_argument("--all", action="store_true", help="show full tree for all PRs")
+    parser.add_argument("--refresh", action="store_true", help="force full API re-fetch")
+    parser.add_argument("--open", action="store_true", help="only open PRs")
+    parser.add_argument("--draft", action="store_true", help="only draft PRs")
+    parser.add_argument("--created", nargs="?", type=int, const=2, default=None, help="created within N days (default: 2)")
+    parser.add_argument("--updated", nargs="?", type=int, const=2, default=None, help="updated within N days (default: 2)")
+    parser.add_argument("--merged", nargs="?", type=int, const=2, default=None, help="merged within N days (default: 2)")
+    parser.add_argument("--closed", nargs="?", type=int, const=2, default=None, help="closed within N days (default: 2)")
+    parser.add_argument("--author", type=str, default=None, help="filter by PR author login")
+    parser.add_argument("--count", action="store_true", help="print PR count and exit")
+    nav = parser.add_mutually_exclusive_group()
+    nav.add_argument("--up", action="store_true", help="switch to parent PR branch (toward main)")
+    nav.add_argument("--down", action="store_true", help="switch to child PR branch (toward leaves)")
+    args = parser.parse_args()
+
+    current_branch, default_branch, repo_url, prs = fetch_all(args.refresh)
+
+    # Navigation: --up / --down (uses unfiltered PRs, exits before display logic)
+    if args.up or args.down:
+        nav_adjacency: dict[str, list[dict]] = {}
+        nav_branch_to_pr: dict[str, dict] = {}
+        for pr in prs:
+            nav_adjacency.setdefault(pr["baseRefName"], []).append(pr)
+            nav_branch_to_pr[pr["headRefName"]] = pr
+        for base in nav_adjacency:
+            nav_adjacency[base].sort(key=lambda p: p["number"])
+
+        if args.up:
+            pr = nav_branch_to_pr.get(current_branch)
+            if not pr:
+                die(f"no PR found for current branch '{current_branch}'")
+            target = pr["baseRefName"]
+            if not target:
+                die("no base branch for current PR")
+        else:  # --down
+            children = nav_adjacency.get(current_branch, [])
+            if not children:
+                die(f"no child PRs based on '{current_branch}'")
+            target = pick_branch(children)
+            if not target:
+                sys.exit(1)
+
+        # Worktree: print path for shell integration (subprocess can't cd parent shell)
+        wt_path = find_worktree_path(target)
+        if wt_path:
+            print(wt_path)
+            sys.exit(0)
+        # Plain checkout
+        cmd = ["git", "checkout", target]
+        os.execvp(cmd[0], cmd)
+
+    # Supplemental fetch for merged/closed PRs (not in OPEN-only cold cache)
+    if args.merged is not None or args.closed is not None:
+        _, owner, repo_name = resolve_repo()
+        existing = {str(pr["number"]) for pr in prs}
+        supplemental: dict[str, dict] = {}
+        if args.merged is not None:
+            supplemental.update(search_prs(owner, repo_name, f"is:merged merged:>={days_ago_iso(args.merged)}"))
+        if args.closed is not None:
+            supplemental.update(search_prs(owner, repo_name, f"-is:open closed:>={days_ago_iso(args.closed)}"))
+        for num, pr in supplemental.items():
+            if num not in existing:
+                prs.append(pr)
+
+    max_width = shutil.get_terminal_size().columns
+
+    # Build maps from all PRs first (filters expand into DAGs, not strip)
+    adjacency: dict[str, list[dict]] = {}
+    head_branches: set[str] = set()
+    branch_to_pr: dict[str, dict] = {}
+
+    for pr in prs:
+        base = pr["baseRefName"]
+        head = pr["headRefName"]
+        adjacency.setdefault(base, []).append(pr)
+        head_branches.add(head)
+        branch_to_pr[head] = pr
+
+    # Filter PRs
+    predicates = []
+    if args.open:
+        predicates.append(lambda pr: pr["state"] == "OPEN" and not pr.get("isDraft", False))
+    if args.draft:
+        predicates.append(lambda pr: pr.get("isDraft", False))
+    if args.created is not None:
+        predicates.append(lambda pr: within_days(pr.get("createdAt"), args.created))
+    if args.updated is not None:
+        predicates.append(lambda pr: within_days(pr.get("updatedAt"), args.updated))
+    if args.merged is not None:
+        predicates.append(lambda pr: pr["state"] == "MERGED" and within_days(pr.get("mergedAt"), args.merged))
+    if args.closed is not None:
+        predicates.append(lambda pr: pr["state"] in {"CLOSED", "MERGED"} and within_days(pr.get("closedAt"), args.closed))
+    if args.author is not None:
+        predicates.append(lambda pr: (pr.get("author") or {}).get("login", "").lower() == args.author.lower())
+
+    if predicates:
+        matched = {pr["headRefName"] for pr in prs if all(p(pr) for p in predicates)}
+        if not matched:
+            console = Console()
+            console.print(default_branch)
+            return
+        # Expand matched PRs to include full DAG context (ancestors + descendants)
+        dag_branches: set[str] = set()
+        for head in matched:
+            # Walk up ancestors
+            branch = head
+            while branch in branch_to_pr:
+                dag_branches.add(branch)
+                branch = branch_to_pr[branch]["baseRefName"]
+            # Walk down descendants
+            stack = [head]
+            while stack:
+                b = stack.pop()
+                dag_branches.add(b)
+                for child in adjacency.get(b, []):
+                    ch = child["headRefName"]
+                    if ch not in dag_branches:
+                        stack.append(ch)
+        prs = [pr for pr in prs if pr["headRefName"] in dag_branches]
+        # Rebuild maps with DAG-expanded PR set
+        adjacency = {}
+        head_branches = set()
+        branch_to_pr = {}
+        for pr in prs:
+            base = pr["baseRefName"]
+            head = pr["headRefName"]
+            adjacency.setdefault(base, []).append(pr)
+            head_branches.add(head)
+            branch_to_pr[head] = pr
+
+    show_all = getattr(args, "all") or bool(predicates)
+
+    if not prs:
+        console = Console()
+        console.print(default_branch)
+        return
+
+    # Sort children by PR number ascending for deterministic output
+    for base in adjacency:
+        adjacency[base].sort(key=lambda p: p["number"])
+
+    # Identify roots: bases that are not any PR's head and not the default branch
+    synthetic_roots = set()
+    for base in adjacency:
+        if base != default_branch and base not in head_branches:
+            synthetic_roots.add(base)
+
+    # Build spine filter: only show the current branch's lineage
+    spine: set[str] | None = None
+    current_pr = branch_to_pr.get(current_branch)
+    if not show_all and current_pr:
+        spine = collect_spine(current_branch, branch_to_pr)
+
+    # Collect visible PRs (respects spine filtering)
+    visible_prs = []
+    vis_visited: set[str] = set()
+    visible_prs.extend(collect_visible_prs(default_branch, adjacency, spine, visited=vis_visited))
+    for root in synthetic_roots:
+        if spine is None or root in spine:
+            visible_prs.extend(collect_visible_prs(root, adjacency, spine, visited=vis_visited))
+
+    if args.count:
+        print(len(visible_prs))
+        return
+
+    # Show author only when multiple distinct authors visible
+    authors = {(pr.get("author") or {}).get("login", "") for pr in visible_prs}
+    authors.discard("")
+    show_author = len(authors) > 1
+
+    # Header line
+    console = Console()
+    if current_pr:
+        header_url = f"{repo_url}/pull/{current_pr['number']}"
+        console.print(f"[bold link={header_url}]#{current_pr['number']}[/bold link] [dim]{current_pr['title']}[/dim]")
+    else:
+        console.print(current_branch)
+
+    # Primary tree: default branch
+    if default_branch in adjacency:
+        tree = Tree(default_branch, guide_style="dim")
+        build_tree_recursive(
+            default_branch, adjacency, branch_to_pr, current_branch, max_width,
+            repo_url, tree, spine, show_author,
+        )
+        console.print(tree)
+
+    # Synthetic root trees (orphan bases) — only if relevant to current branch or --all
+    for root in sorted(synthetic_roots):
+        if spine is not None and root not in spine:
+            continue
+        tree = Tree(root, guide_style="dim")
+        build_tree_recursive(
+            root, adjacency, branch_to_pr, current_branch, max_width,
+            repo_url, tree, spine, show_author,
+        )
+        console.print(tree)
+
+
+if __name__ == "__main__":
+    main()
