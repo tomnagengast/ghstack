@@ -101,7 +101,8 @@ PR_FIELDS = """
         author { login }
         latestReviews(first: 10) { nodes { state } }"""
 
-PULLS_QUERY = """
+PULLS_QUERY = (
+    """
 query($owner: String!, $repo: String!, $cursor: String) {
   repository(owner: $owner, name: $repo) {
     defaultBranchRef { name }
@@ -109,24 +110,31 @@ query($owner: String!, $repo: String!, $cursor: String) {
     pullRequests(first: 100, after: $cursor, states: [OPEN],
                  orderBy: {field: UPDATED_AT, direction: DESC}) {
       pageInfo { hasNextPage endCursor }
-      nodes {""" + PR_FIELDS + """
+      nodes {"""
+    + PR_FIELDS
+    + """
       }
     }
   }
 }
 """
+)
 
-SEARCH_QUERY = """
+SEARCH_QUERY = (
+    """
 query($q: String!, $cursor: String) {
   search(query: $q, type: ISSUE, first: 100, after: $cursor) {
     pageInfo { hasNextPage endCursor }
     nodes {
-      ... on PullRequest {""" + PR_FIELDS + """
+      ... on PullRequest {"""
+    + PR_FIELDS
+    + """
       }
     }
   }
 }
 """
+)
 
 
 def parse_repo_id(remote_url: str) -> str | None:
@@ -188,7 +196,9 @@ def normalize_pr(node: dict) -> dict:
 def get_branch() -> str:
     return subprocess.run(
         ["git", "branch", "--show-current"],
-        capture_output=True, text=True, check=True,
+        capture_output=True,
+        text=True,
+        check=True,
     ).stdout.strip()
 
 
@@ -202,16 +212,17 @@ def find_worktree_path(branch: str) -> str | None:
     """Find the worktree directory for a branch via git worktree list, or None."""
     result = subprocess.run(
         ["git", "worktree", "list", "--porcelain"],
-        capture_output=True, text=True,
+        capture_output=True,
+        text=True,
     )
     if result.returncode != 0:
         return None
     path = None
     for line in result.stdout.splitlines():
         if line.startswith("worktree "):
-            path = line[len("worktree "):]
+            path = line[len("worktree ") :]
         elif line.startswith("branch refs/heads/") and path:
-            if line[len("branch refs/heads/"):] == branch:
+            if line[len("branch refs/heads/") :] == branch:
                 return path
     return None
 
@@ -276,7 +287,9 @@ def search_prs(owner: str, repo_name: str, qualifiers: str) -> dict[str, dict]:
     return prs
 
 
-def fetch_incremental(owner: str, repo_name: str, cache: dict) -> tuple[str, dict[str, dict]]:
+def fetch_incremental(
+    owner: str, repo_name: str, cache: dict
+) -> tuple[str, dict[str, dict]]:
     """Fetch only PRs updated since watermark via GraphQL search."""
     watermark = datetime.fromtimestamp(cache["fetched_at"] - 120, tz=timezone.utc)
     watermark_str = watermark.strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -288,7 +301,9 @@ def resolve_repo() -> tuple[str, str, str]:
     try:
         remote_url = subprocess.run(
             ["git", "remote", "get-url", "origin"],
-            capture_output=True, text=True, check=True,
+            capture_output=True,
+            text=True,
+            check=True,
         ).stdout.strip()
     except subprocess.CalledProcessError:
         remote_url = ""
@@ -312,7 +327,12 @@ def fetch_all(force_refresh: bool = False) -> tuple[str, str, str, list[dict]]:
 
     # Hot path: cache < 60s old
     if cache and age < HOT_TTL:
-        return get_branch(), cache["default_branch"], cache["repo_url"], list(cache["prs"].values())
+        return (
+            get_branch(),
+            cache["default_branch"],
+            cache["repo_url"],
+            list(cache["prs"].values()),
+        )
 
     # Warm path: cache 60s–10min old
     if cache and age < WARM_TTL:
@@ -320,16 +340,24 @@ def fetch_all(force_refresh: bool = False) -> tuple[str, str, str, list[dict]]:
         cache["prs"].update(updated_prs)
         cache["fetched_at"] = now
         save_cache(cp, cache)
-        return branch, cache["default_branch"], cache["repo_url"], list(cache["prs"].values())
+        return (
+            branch,
+            cache["default_branch"],
+            cache["repo_url"],
+            list(cache["prs"].values()),
+        )
 
     # Cold path: full fetch
     branch, default_branch, repo_url, prs = fetch_cold(owner, repo_name)
-    save_cache(cp, {
-        "fetched_at": now,
-        "default_branch": default_branch,
-        "repo_url": repo_url,
-        "prs": prs,
-    })
+    save_cache(
+        cp,
+        {
+            "fetched_at": now,
+            "default_branch": default_branch,
+            "repo_url": repo_url,
+            "prs": prs,
+        },
+    )
     return branch, default_branch, repo_url, list(prs.values())
 
 
@@ -363,10 +391,18 @@ def build_style(pr: dict) -> Style:
     if any(r.get("state") == "COMMENTED" for r in latest_reviews):
         underline = True
 
-    return Style(color=color, bgcolor=bgcolor, underline=underline, underline2=underline2)
+    return Style(
+        color=color, bgcolor=bgcolor, underline=underline, underline2=underline2
+    )
 
 
-def pr_label(pr: dict, current_branch: str, max_width: int, repo_url: str, show_author: bool = False) -> str:
+def pr_label(
+    pr: dict,
+    current_branch: str,
+    max_width: int,
+    repo_url: str,
+    show_author: bool = False,
+) -> str:
     style = build_style(pr)
     is_current = pr["headRefName"] == current_branch
     if is_current:
@@ -423,7 +459,15 @@ def collect_visible_prs(
             continue
         visited.add(head)
         result.append(pr)
-        result.extend(collect_visible_prs(head, adjacency, spine, in_subtree or (spine is not None and head in spine), visited))
+        result.extend(
+            collect_visible_prs(
+                head,
+                adjacency,
+                spine,
+                in_subtree or (spine is not None and head in spine),
+                visited,
+            )
+        )
     return result
 
 
@@ -451,30 +495,78 @@ def build_tree_recursive(
         if spine is not None and not in_subtree and head not in spine:
             continue
         visited.add(head)
-        label = pr_label(pr, current_branch, max_width - depth * 4, repo_url, show_author)
+        label = pr_label(
+            pr, current_branch, max_width - depth * 4, repo_url, show_author
+        )
         child_tree = parent_tree.add(label)
         child_in_subtree = in_subtree or (spine is not None and head in spine)
         build_tree_recursive(
-            head, adjacency, branch_to_pr, current_branch, max_width, repo_url,
-            child_tree, spine, show_author, child_in_subtree, depth + 1, visited,
+            head,
+            adjacency,
+            branch_to_pr,
+            current_branch,
+            max_width,
+            repo_url,
+            child_tree,
+            spine,
+            show_author,
+            child_in_subtree,
+            depth + 1,
+            visited,
         )
 
 
 def main():
     parser = argparse.ArgumentParser(description="PR Stack Tree Visualizer")
     parser.add_argument("--all", action="store_true", help="show full tree for all PRs")
-    parser.add_argument("--refresh", action="store_true", help="force full API re-fetch")
+    parser.add_argument(
+        "--refresh", action="store_true", help="force full API re-fetch"
+    )
     parser.add_argument("--open", action="store_true", help="only open PRs")
     parser.add_argument("--draft", action="store_true", help="only draft PRs")
-    parser.add_argument("--created", nargs="?", type=int, const=2, default=None, help="created within N days (default: 2)")
-    parser.add_argument("--updated", nargs="?", type=int, const=2, default=None, help="updated within N days (default: 2)")
-    parser.add_argument("--merged", nargs="?", type=int, const=2, default=None, help="merged within N days (default: 2)")
-    parser.add_argument("--closed", nargs="?", type=int, const=2, default=None, help="closed within N days (default: 2)")
-    parser.add_argument("--author", type=str, default=None, help="filter by PR author login")
+    parser.add_argument(
+        "--created",
+        nargs="?",
+        type=int,
+        const=2,
+        default=None,
+        help="created within N days (default: 2)",
+    )
+    parser.add_argument(
+        "--updated",
+        nargs="?",
+        type=int,
+        const=2,
+        default=None,
+        help="updated within N days (default: 2)",
+    )
+    parser.add_argument(
+        "--merged",
+        nargs="?",
+        type=int,
+        const=2,
+        default=None,
+        help="merged within N days (default: 2)",
+    )
+    parser.add_argument(
+        "--closed",
+        nargs="?",
+        type=int,
+        const=2,
+        default=None,
+        help="closed within N days (default: 2)",
+    )
+    parser.add_argument(
+        "--author", type=str, default=None, help="filter by PR author login"
+    )
     parser.add_argument("--count", action="store_true", help="print PR count and exit")
     nav = parser.add_mutually_exclusive_group()
-    nav.add_argument("--up", action="store_true", help="switch to parent PR branch (toward main)")
-    nav.add_argument("--down", action="store_true", help="switch to child PR branch (toward leaves)")
+    nav.add_argument(
+        "--up", action="store_true", help="switch to parent PR branch (toward main)"
+    )
+    nav.add_argument(
+        "--down", action="store_true", help="switch to child PR branch (toward leaves)"
+    )
     args = parser.parse_args()
 
     current_branch, default_branch, repo_url, prs = fetch_all(args.refresh)
@@ -519,9 +611,17 @@ def main():
         existing = {str(pr["number"]) for pr in prs}
         supplemental: dict[str, dict] = {}
         if args.merged is not None:
-            supplemental.update(search_prs(owner, repo_name, f"is:merged merged:>={days_ago_iso(args.merged)}"))
+            supplemental.update(
+                search_prs(
+                    owner, repo_name, f"is:merged merged:>={days_ago_iso(args.merged)}"
+                )
+            )
         if args.closed is not None:
-            supplemental.update(search_prs(owner, repo_name, f"-is:open closed:>={days_ago_iso(args.closed)}"))
+            supplemental.update(
+                search_prs(
+                    owner, repo_name, f"-is:open closed:>={days_ago_iso(args.closed)}"
+                )
+            )
         for num, pr in supplemental.items():
             if num not in existing:
                 prs.append(pr)
@@ -543,7 +643,9 @@ def main():
     # Filter PRs
     predicates = []
     if args.open:
-        predicates.append(lambda pr: pr["state"] == "OPEN" and not pr.get("isDraft", False))
+        predicates.append(
+            lambda pr: pr["state"] == "OPEN" and not pr.get("isDraft", False)
+        )
     if args.draft:
         predicates.append(lambda pr: pr.get("isDraft", False))
     if args.created is not None:
@@ -551,11 +653,24 @@ def main():
     if args.updated is not None:
         predicates.append(lambda pr: within_days(pr.get("updatedAt"), args.updated))
     if args.merged is not None:
-        predicates.append(lambda pr: pr["state"] == "MERGED" and within_days(pr.get("mergedAt"), args.merged))
+        predicates.append(
+            lambda pr: (
+                pr["state"] == "MERGED" and within_days(pr.get("mergedAt"), args.merged)
+            )
+        )
     if args.closed is not None:
-        predicates.append(lambda pr: pr["state"] in {"CLOSED", "MERGED"} and within_days(pr.get("closedAt"), args.closed))
+        predicates.append(
+            lambda pr: (
+                pr["state"] in {"CLOSED", "MERGED"}
+                and within_days(pr.get("closedAt"), args.closed)
+            )
+        )
     if args.author is not None:
-        predicates.append(lambda pr: (pr.get("author") or {}).get("login", "").lower() == args.author.lower())
+        predicates.append(
+            lambda pr: (
+                (pr.get("author") or {}).get("login", "").lower() == args.author.lower()
+            )
+        )
 
     if predicates:
         matched = {pr["headRefName"] for pr in prs if all(p(pr) for p in predicates)}
@@ -618,10 +733,14 @@ def main():
     # Collect visible PRs (respects spine filtering)
     visible_prs = []
     vis_visited: set[str] = set()
-    visible_prs.extend(collect_visible_prs(default_branch, adjacency, spine, visited=vis_visited))
+    visible_prs.extend(
+        collect_visible_prs(default_branch, adjacency, spine, visited=vis_visited)
+    )
     for root in synthetic_roots:
         if spine is None or root in spine:
-            visible_prs.extend(collect_visible_prs(root, adjacency, spine, visited=vis_visited))
+            visible_prs.extend(
+                collect_visible_prs(root, adjacency, spine, visited=vis_visited)
+            )
 
     if args.count:
         print(len(visible_prs))
@@ -636,7 +755,9 @@ def main():
     console = Console()
     if current_pr:
         header_url = f"{repo_url}/pull/{current_pr['number']}"
-        console.print(f"[bold link={header_url}]#{current_pr['number']}[/bold link] [dim]{current_pr['title']}[/dim]")
+        console.print(
+            f"[bold link={header_url}]#{current_pr['number']}[/bold link] [dim]{current_pr['title']}[/dim]"
+        )
     else:
         console.print(current_branch)
 
@@ -644,8 +765,15 @@ def main():
     if default_branch in adjacency:
         tree = Tree(default_branch, guide_style="dim")
         build_tree_recursive(
-            default_branch, adjacency, branch_to_pr, current_branch, max_width,
-            repo_url, tree, spine, show_author,
+            default_branch,
+            adjacency,
+            branch_to_pr,
+            current_branch,
+            max_width,
+            repo_url,
+            tree,
+            spine,
+            show_author,
         )
         console.print(tree)
 
@@ -655,8 +783,15 @@ def main():
             continue
         tree = Tree(root, guide_style="dim")
         build_tree_recursive(
-            root, adjacency, branch_to_pr, current_branch, max_width,
-            repo_url, tree, spine, show_author,
+            root,
+            adjacency,
+            branch_to_pr,
+            current_branch,
+            max_width,
+            repo_url,
+            tree,
+            spine,
+            show_author,
         )
         console.print(tree)
 
